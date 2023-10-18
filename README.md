@@ -1,2 +1,2 @@
 # Quantum-Machine-Learning
-This repository is a tutorial on quantum machine learning.
+This repository will include toy examples of quantum machine learning (WIP).
