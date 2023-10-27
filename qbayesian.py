@@ -1,63 +1,74 @@
-# Installation: pip install qiskit
+# This code is part of a Qiskit project.
+#
+# (C) Copyright IBM 2021, 2023.
+#
+# This code is licensed under the Apache License, Version 2.0. You may
+# obtain a copy of this license in the LICENSE.txt file in the root directory
+# of this source tree or at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# Any modifications or derivative works of this code must retain this
+# copyright notice, and modified files need to carry a notice indicating
+# that they have been altered from the originals.
 
-import numpy as np
-import math
+
 from qiskit import Aer, QuantumCircuit, transpile
 from qiskit.visualization import plot_histogram
-from pgmpy.models import BayesianNetwork
 from qiskit.circuit import QuantumRegister
 from qiskit.circuit.library import GroverOperator
 
 class QBayesian:
 
     # Discrete quantum Bayesian network
-    def __init__(self, bNetwork: BayesianNetwork = None, circuit: QuantumCircuit = None):
-        if bNetwork is None and circuit is None:
-            raise ValueError("One Bayesian network or quantum circuit must be provided")
+    def __init__(self, circuit: QuantumCircuit = None):
+        """
+        Run the provided quantum circuit on the Aer simulator backend.
+
+        Parameters:
+            - circuit: The quantum circuit to be executed.
+            Every r.v. should be assigned exactly one register of one distinct qubit.
+            The qubits in the circuit should be enumerated by
+
+        """
+        # TODO: test if every register contains only one unique qubit
+
+        if circuit is None:
+            raise ValueError("Quantum circuit must be provided")
+
+        self.circ = circuit
+        # Label of register mapped to its qubit
+        self.label2qubit = {qrg.name: qrg[0] for qrg in self.circ.qregs}
+        # Label of register mapped to its qubit index
+        self.label2qidx = {qrg.name: idx for idx, qrg in enumerate(self.circ.qregs)}
         self.samples = {}
-        self.tValidS = 0
-        if circuit is not None:
-            self.circuit = circuit
-        else:
-            # Represent any discrete Bayesian network with any number of nodes.
-            self.network = bNetwork
-            self.initialize()
 
-    def initialize(self):
-        """Initializes the circuit to a specific state."""
-        # Quantum register
-        qr_list = list()
-        for node_key, node_card in self.network.cardinalities:  # returns the number of states for each node (variable)
-            m_i = math.ceil(math.log2(node_card))
-            qr_i = QuantumRegister(m_i, name=node_key)
-            qr_list.append(qr_i)
 
-        # Quantum circuit
+    def getSe(self, ctrls):
+        """
+        Creates Se for Grover
 
+        ctrls: control qubits represent the evidence var
+        """
+        # Create circuit with registers from given quantum circuit
+        opSe = QuantumCircuit(*self.circ.qregs)
+        # Q=X\E
+        query_var = {self.label2qubit[reg.name] for reg in self.circ.qregs} - set(ctrls)
+        # Generate Se
+        for q in query_var:
+            # multi control z gate
+            opSe.h(q)
+            opSe.mcx(ctrls, q)
+            opSe.h(q)
+            # x gate
+            opSe.x(q)
+            # multi control z gate
+            opSe.h(q)
+            opSe.mcx(ctrls, q)
+            opSe.h(q)
+            # x gate
+            opSe.x(q)
+        return opSe
 
     def rejectionSampling(self, evidence):
-
-        def getSe(ctrls):
-            """
-            ctrls: control qubits are the evidence var
-            """
-            opSe = QuantumCircuit(self.circuit.num_qubits)
-            query_var = set(self.circuit.qubits)-set(ctrls)
-            for q in query_var:
-                # multi control z gate
-                opSe.h(q)
-                opSe.mcx(ctrls, q)
-                opSe.h(q)
-                # x gate
-                opSe.x(q)
-                # multi control z gate
-                opSe.h(q)
-                opSe.mcx(ctrls, q)
-                opSe.h(q)
-                # x gate
-                opSe.x(q)
-            return opSe
-
         def run_circuit(circuit, shots=10_000):
             """
             Run the provided quantum circuit on the Aer simulator backend.
@@ -85,84 +96,64 @@ class QBayesian:
 
             return counts
 
-        opSe = getSe(query)
+        # Get Se
+        e_reg = [self.label2qubit[qrg.name] for qrg in self.circ.qregs if qrg.name in evidence]
+        opSe = self.getSe(e_reg)
         # Grover
-        opG = GroverOperator(opSe, self.circuit)
-        # Circuit
-        qregs = self.circuit.qregs
+        opG = GroverOperator(opSe, self.circ)
+        # Amplitude amplification circuit
+        qregs = self.circ.qregs
         qc = QuantumCircuit(*qregs)
-        qc.append(self.circuit, qregs)
+        qc.append(self.circ, qregs)
         qc.append(opG, qregs)
-
+        # Measure
         qc.measure_all()
         # Run circuit
         counts = run_circuit(qc)
-        # Calc inference
+        # Retrieve valid samples
         self.samples = {}
-        self.tValidS = 0
-        # TODO check if evidence and query build all vars - YES
         # Assume key is bin and e_key is the qubits number
         for key, val in counts.items():
             accept = True
             for e_key, e_val in evidence.items():
-                if key[e_key] != e_val:
+                if int(key[self.label2qidx[e_key]]) != e_val:
                     accept = False
                     break
             if accept:
                 self.samples[key] = val
-                self.tValidS += val
         return self.samples
 
 
-    def inference(self, query, evidence: None):
+    def inference(self, query, evidence: dict=None):
+        """
+        - query: The query variables. If Q is a real subset of X\E the rest will be filled
+        - evidence: Provide evidence if rejection sampling should be executed. If you want to indicate no evidence
+        insert an empty list. If you want to indicate no new evidence keep this variable empty.
+        """
         if evidence is not None:
             self.rejectionSampling(query, evidence)
+        else:
+            if not self.samples:
+                raise ValueError("Provide evidence for rejection sampling or indicate no evidence with empty list")
+
         q_count = 0
+        tValidS = 0
         for sample_key, sample_val in self.samples.items():
             add = True
             for q_key, q_val in query.items():
-                if sample_key[q_key]!=q_val:
-                    add=False
+                if int(sample_key[self.label2qidx[q_key]]) != q_val:
+                    add = False
                     break
             if add:
                 q_count += sample_val
-        return q_count/self.tValidS
+            tValidS += sample_val
+        return q_count/tValidS
 
 
-    def measure(self):
-        """Adds a measurement operation to all qubits."""
-        self.circuit.measure_all()
-
-    def simulate(self):
-        """Simulates the circuit and returns the probability distribution."""
-        simulator = AerSimulator()
-        compiled_circuit = transpile(self.circuit, simulator)
-        result = simulator.run(compiled_circuit).result()
-        counts = result.get_counts(self.circuit)
-        return counts
-
-    def visualize(self, counts):
-        """Visualizes the result."""
-        return plot_histogram(counts)
+    def visualize(self):
+        """Visualizes valid samples"""
+        return plot_histogram(self.samples)
 
 
-# Example usage:
 
 
-# Define a 2-qubit system
-qbi = QuantumBayesianInference(2)
-
-# Initialize with some state (for simplicity, the |00> state is used)
-initial_state = [1, 0, 0, 0]  # |00> state for 2 qubits
-qbi.initialize(initial_state)
-
-# Apply some operations (Hadamard gate on first qubit and CNOT gate)
-qbi.apply_gate('H', 0)
-qbi.apply_gate('CX', 0, 1)
-
-# Measure the qubits
-qbi.measure()
-
-# Simulate and visualize the circuit
-counts = qbi.simulate()
-qbi.visualize(counts)
